@@ -1,0 +1,369 @@
+Main.py
+
+import sys
+from PyQt5.QtWidgets import QApplication
+from app_ui import MainWindow
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+=================================================
+detection.py
+import cv2
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
+from ultralytics import YOLO
+import torch
+import time
+
+
+class DetectionThread(QThread):
+    frame_processed = pyqtSignal(QPixmap)  # Signal to send processed frame
+    detection_result = pyqtSignal(str)  # Signal for detection result
+    log_message = pyqtSignal(str)  # Signal for log messages
+    detection_summary = pyqtSignal(dict)  # Signal for detection metrics
+    warning_signal = pyqtSignal(str)  # Signal for warning popups
+
+    def __init__(self, source, model_path, confidence=0.25, frame_skip=1):
+        super().__init__()
+        self.source = source
+        self.confidence = confidence
+        self.frame_skip = frame_skip
+        self.running = False
+        self.paused = False
+        self.consecutive_damaged_count = 0
+
+        try:
+            # Initialize YOLO model
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model = YOLO(model_path)
+            self.log_message.emit(f"Model loaded successfully on {device}.")
+        except Exception as e:
+            self.model = None
+            self.log_message.emit(f"Error loading YOLO model: {e}")
+
+    def run(self):
+        if not self.model:
+            self.log_message.emit("Detection cannot start. Model not loaded.")
+            return
+
+        self.running = True
+        cap = cv2.VideoCapture(self.source)
+
+        if not cap.isOpened():
+            self.log_message.emit("Error: Could not open video source.")
+            return
+
+        frame_count = 0
+
+        while self.running:
+            if self.paused:
+                self.msleep(100)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                self.log_message.emit("End of video or failed to grab frame.")
+                break
+
+            frame_count += 1
+            if frame_count % self.frame_skip != 0:
+                continue
+
+            try:
+                start_time = time.time()
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Run YOLO model prediction
+                results = self.model.predict(source=frame_rgb, conf=self.confidence, device="cpu", show=False)
+                annotated_frame = results[0].plot()
+
+                # Convert annotated frame to QPixmap
+                height, width, channels = annotated_frame.shape
+                bytes_per_line = channels * width
+                qt_image = QImage(annotated_frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qt_image)
+                self.frame_processed.emit(pixmap)
+
+                # Count damaged and intact items
+                damaged_in_frame = sum(1 for box in results[0].boxes if box.cls.numpy()[0] == 0)
+                intact_in_frame = sum(1 for box in results[0].boxes if box.cls.numpy()[0] == 1)
+
+                # Emit results for each detected object
+                for _ in range(damaged_in_frame):
+                    self.detection_result.emit("Damaged")
+                for _ in range(intact_in_frame):
+                    self.detection_result.emit("Intact")
+
+                # Warning for consecutive damaged detections
+                self.consecutive_damaged_count = (
+                    self.consecutive_damaged_count + damaged_in_frame if damaged_in_frame else 0
+                )
+
+                if self.consecutive_damaged_count > 10:
+                    self.warning_signal.emit("Warning: More than 10 consecutive damaged items detected!")
+                    self.consecutive_damaged_count = 0
+
+                elapsed_time = time.time() - start_time
+                self.detection_summary.emit({
+                    "frame_count": frame_count,
+                    "objects_detected": len(results[0].boxes),
+                    "processing_time": elapsed_time,
+                    "damaged": damaged_in_frame,
+                    "intact": intact_in_frame,
+                })
+
+            except Exception as e:
+                self.log_message.emit(f"Error during detection: {e}")
+                break
+
+        cap.release()
+        self.log_message.emit("Video source released. Detection thread stopped.")
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        state = "paused" if self.paused else "resumed"
+        self.log_message.emit(f"Detection thread {state}.")
+
+==================================
+app_ui.py
+==================================
+
+import csv
+from PyQt5.QtWidgets import (
+    QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QTextEdit, QLabel, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox
+)
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QThread, pyqtSignal
+import pyqtgraph as pg
+import datetime
+from detection import DetectionThread
+
+
+class GraphWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Real-Time Detection Graph")
+        self.setGeometry(200, 200, 800, 600)
+
+        self.graph_widget = pg.PlotWidget()
+        self.setCentralWidget(self.graph_widget)
+
+        self.graph_widget.setTitle("Detection Count Over Time")
+        self.graph_widget.setLabel('left', 'Count')
+        self.graph_widget.setLabel('bottom', 'Time (s)')
+        self.graph_widget.addLegend()
+        self.graph_widget.showGrid(x=True, y=True)
+
+        self.graph_time = []
+        self.graph_damaged = []
+        self.graph_intact = []
+
+        self.damaged_plot = self.graph_widget.plot(pen='r', name='Damaged')
+        self.intact_plot = self.graph_widget.plot(pen='g', name='Intact')
+
+        self.graph_start_time = datetime.datetime.now()
+
+    def update_graph(self, damaged_count, intact_count):
+        elapsed_time = (datetime.datetime.now() - self.graph_start_time).total_seconds()
+        self.graph_time.append(elapsed_time)
+        self.graph_damaged.append(damaged_count)
+        self.graph_intact.append(intact_count)
+
+        self.damaged_plot.setData(self.graph_time, self.graph_damaged)
+        self.intact_plot.setData(self.graph_time, self.graph_intact)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Defect Detection Application")
+        self.setGeometry(100, 100, 1400, 900)
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QVBoxLayout(self.central_widget)
+
+        # Video display - Bigger Area
+        self.video_label = QLabel("Video Display Area")
+        self.video_label.setStyleSheet("background-color: black;")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setFixedHeight(500)  # Increased height
+        self.layout.addWidget(self.video_label)
+
+        # Counters
+        self.counter_layout = QHBoxLayout()
+        self.total_label = QLabel("Total Count: 0")
+        self.damaged_label = QLabel("Damaged Count: 0")
+        self.intact_label = QLabel("Intact Count: 0")
+        for label in [self.total_label, self.damaged_label, self.intact_label]:
+            label.setStyleSheet("font-size: 16px; padding: 5px;")
+            self.counter_layout.addWidget(label)
+        self.layout.addLayout(self.counter_layout)
+
+        # Buttons
+        self.button_layout = QHBoxLayout()
+        self.create_button("Start Webcam", "#4CAF50", self.start_webcam_detection)
+        self.create_button("Select File", "#008CBA", self.start_file_detection)
+        self.create_button("Pause", "#FFC107", self.pause_detection)
+        self.create_button("Resume", "#4CAF50", self.resume_detection)
+        self.create_button("Stop", "#f44336", self.stop_detection)
+        self.create_button("Export Report", "#673AB7", self.export_report)
+        self.create_button("Open Graph", "#FF5722", self.open_graph_window)
+        self.layout.addLayout(self.button_layout)
+
+        # Log area
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setFixedHeight(100)  # Reduced height to adjust layout
+        self.log_area.setStyleSheet("background-color: #f1f1f1;")
+        self.layout.addWidget(self.log_area)
+
+        # Detection table
+        self.table_widget = QTableWidget()
+        self.table_widget.setColumnCount(3)
+        self.table_widget.setHorizontalHeaderLabels(["Timestamp", "Status", "Details"])
+        self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_widget.setFixedHeight(200)  # Reduced height for table
+        self.layout.addWidget(self.table_widget)
+
+        self.detection_thread = None
+        self.total_count = 0
+        self.damaged_count = 0
+        self.intact_count = 0
+        self.consecutive_damaged_count = 0  # Track consecutive damaged detections
+
+        self.graph_window = None
+
+    def create_button(self, text, color, action):
+        button = QPushButton(text)
+        button.setStyleSheet(f"background-color: {color}; color: white; font-size: 14px; padding: 8px;")
+        button.clicked.connect(action)
+        self.button_layout.addWidget(button)
+
+    def update_display(self, pixmap: QPixmap):
+        self.video_label.setPixmap(pixmap)
+
+    def update_counters(self, result: str):
+        if result not in ["Damaged", "Intact"]:
+            return
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        details = "Defective item detected." if result == "Damaged" else "Non-defective item."
+
+        if result == "Damaged":
+            self.damaged_count += 1
+            self.consecutive_damaged_count += 1
+        else:
+            self.intact_count += 1
+            self.consecutive_damaged_count = 0  # Reset on an intact detection
+
+        self.total_count += 1
+        self.total_label.setText(f"Total Count: {self.total_count}")
+        self.damaged_label.setText(f"Damaged Count: {self.damaged_count}")
+        self.intact_label.setText(f"Intact Count: {self.intact_count}")
+
+        # Update table
+        row_position = self.table_widget.rowCount()
+        self.table_widget.insertRow(row_position)
+        self.table_widget.setItem(row_position, 0, QTableWidgetItem(timestamp))
+        self.table_widget.setItem(row_position, 1, QTableWidgetItem(result))
+        self.table_widget.setItem(row_position, 2, QTableWidgetItem(details))
+
+        # Check for alert condition
+        if self.consecutive_damaged_count > 10:
+            self.trigger_alert()
+
+        # Update graph window
+        if self.graph_window:
+            self.graph_window.update_graph(self.damaged_count, self.intact_count)
+
+    def append_log(self, message: str):
+        self.log_area.append(message)
+        self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
+
+    def trigger_alert(self):
+        QMessageBox.warning(
+            self,
+            "Alert: Consistent Defect Detected",
+            "More than 10 consecutive defective items detected!"
+        )
+        self.consecutive_damaged_count = 0  # Reset after alert
+
+    def start_webcam_detection(self):
+        self.start_detection(0)
+
+    def start_file_detection(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Source File", "", "Images/Video Files (*.png *.jpg *.mp4)")
+        if file_path:
+            self.start_detection(file_path)
+
+    def start_detection(self, source):
+        if self.detection_thread and self.detection_thread.isRunning():
+            self.stop_detection()
+
+        self.reset_counters()
+        self.detection_thread = DetectionThread(source=source, model_path="models/best.pt")
+        self.detection_thread.frame_processed.connect(self.update_display)
+        self.detection_thread.detection_result.connect(self.update_counters)
+        self.detection_thread.log_message.connect(self.append_log)
+        self.detection_thread.start()
+
+    def pause_detection(self):
+        if self.detection_thread and self.detection_thread.isRunning():
+            self.detection_thread.toggle_pause()
+            self.append_log("Detection paused.")
+
+    def resume_detection(self):
+        if self.detection_thread and self.detection_thread.isRunning():
+            self.detection_thread.toggle_pause()
+            self.append_log("Detection resumed.")
+
+    def stop_detection(self):
+        if self.detection_thread:
+            self.detection_thread.stop()
+            self.detection_thread = None
+            self.append_log("Detection stopped.")
+
+    def reset_counters(self):
+        self.total_count = 0
+        self.damaged_count = 0
+        self.intact_count = 0
+        self.consecutive_damaged_count = 0
+        self.total_label.setText("Total Count: 0")
+        self.damaged_label.setText("Damaged Count: 0")
+        self.intact_label.setText("Intact Count: 0")
+        self.table_widget.setRowCount(0)
+
+    def open_graph_window(self):
+        if not self.graph_window:
+            self.graph_window = GraphWindow()
+        self.graph_window.show()
+
+    def export_report(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Report", "", "CSV Files (*.csv)")
+        if file_path:
+            try:
+                with open(file_path, mode='w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(["Timestamp", "Status", "Details"])
+                    for row in range(self.table_widget.rowCount()):
+                        timestamp = self.table_widget.item(row, 0).text()
+                        status = self.table_widget.item(row, 1).text()
+                        details = self.table_widget.item(row, 2).text()
+                        writer.writerow([timestamp, status, details])
+                QMessageBox.information(self, "Export Successful", f"Report successfully exported to {file_path}.")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"An error occurred: {e}")
