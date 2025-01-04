@@ -22,7 +22,8 @@ class DetectionThread(QThread):
         self.running = False
         self.paused = False
         self.consecutive_damaged_count = 0
-        self.line_y_position = None  # Removed default horizontal line position for flexibility
+        self.line_y_position = None
+        self.tracked_objects = {}  # Dictionary to track objects crossing the line
 
         try:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -62,11 +63,11 @@ class DetectionThread(QThread):
             try:
                 start_time = time.time()
 
-                # Resize frame for better visualization in the display area
+                # Pre-process frame
                 frame = cv2.resize(frame, (800, 600))  # Adjust size as necessary
-
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+                # Predict using the YOLO model
                 results = self.model.predict(
                     source=frame_rgb,
                     conf=self.confidence,
@@ -76,6 +77,7 @@ class DetectionThread(QThread):
                 )
                 annotated_frame = self.annotate_frame(frame_rgb, results[0].boxes)
 
+                # Convert frame for GUI
                 height, width, channels = annotated_frame.shape
                 qt_image = QImage(
                     annotated_frame.data, width, height,
@@ -84,9 +86,11 @@ class DetectionThread(QThread):
                 pixmap = QPixmap.fromImage(qt_image)
                 self.frame_processed.emit(pixmap)
 
+                # Count and handle detections
                 damaged, intact = self.count_detections(results[0].boxes)
                 self.handle_detections(damaged, intact)
 
+                # Log performance metrics
                 elapsed_time = time.time() - start_time
                 self.detection_summary.emit({
                     "frame_count": frame_count,
@@ -106,30 +110,50 @@ class DetectionThread(QThread):
         self.log_message.emit("Video source released. Detection thread stopped.")
 
     def annotate_frame(self, frame, boxes):
-        """Annotates the frame with detection results and adds a horizontal line."""
-        # Draw the horizontal line
+        """Annotates the frame with detection results and checks for line crossing."""
         if self.line_y_position is None:
-            self.line_y_position = frame.shape[0] // 2  # Default to the center of the frame
+            self.line_y_position = int(frame.shape[0] * 0.35)  # Default to 35% of the frame height
 
         line_color = (0, 255, 255)  # Yellow line
         line_thickness = 2
         cv2.line(frame, (0, self.line_y_position), (frame.shape[1], self.line_y_position), line_color, line_thickness)
 
-        # Annotate bounding boxes
+        current_frame_objects = {}
+
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])  # Get bounding box coordinates
             confidence = float(box.conf[0])  # Confidence score
             cls = int(box.cls[0])  # Class ID
 
             label = "Damaged" if cls == 0 else "Intact"
-            color = (255, 0, 0) if cls == 0 else (0, 255, 0)  # Red for damaged, green for intact
-
+            color = (255, 0, 0) if cls == 0 else (0, 255, 0)
             display_text = f"{label}: {confidence:.2f}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 frame, display_text, (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1
             )
+
+            object_id = (x1 + x2) // 2
+            current_frame_objects[object_id] = y2
+
+            if object_id in self.tracked_objects:
+                previous_y2 = self.tracked_objects[object_id]
+                if previous_y2 < self.line_y_position <= y2:
+                    self.tracked_objects[object_id] = y2
+                    self.log_message.emit(f"{label} object crossed the line.")
+                    if cls == 0:
+                        self.detection_result.emit("Damaged")
+                    else:
+                        self.detection_result.emit("Intact")
+            else:
+                self.tracked_objects[object_id] = y2
+
+        self.tracked_objects = {
+            obj_id: y2 for obj_id, y2 in self.tracked_objects.items()
+            if obj_id in current_frame_objects
+        }
+
         return frame
 
     def count_detections(self, boxes):

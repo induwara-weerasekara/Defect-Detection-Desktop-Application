@@ -13,7 +13,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Defect Detection Application")
-        self.setGeometry(100, 100, 1200, 800)  # Reduced initial size for better proportion
+        self.setGeometry(100, 100, 1200, 800)
 
         # Main Layout
         self.central_widget = QWidget()
@@ -24,7 +24,7 @@ class MainWindow(QMainWindow):
         self.video_label = QLabel()
         self.video_label.setStyleSheet("background-color: black;")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(self.video_label, stretch=6)  # Higher stretch for more space
+        self.main_layout.addWidget(self.video_label, stretch=6)
 
         # Counter and Log Section
         self.stats_layout = QVBoxLayout()
@@ -59,7 +59,7 @@ class MainWindow(QMainWindow):
         self.create_button("Open Graph", "#FF5722", self.open_graph_window)
         self.main_layout.addLayout(self.button_layout, stretch=1)
 
-        # Table Section (Optional Display for Detections)
+        # Table Section
         self.table_widget = QTableWidget()
         self.table_widget.setColumnCount(3)
         self.table_widget.setHorizontalHeaderLabels(["Timestamp", "Status", "Details"])
